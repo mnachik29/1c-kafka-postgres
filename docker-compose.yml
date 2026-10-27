@@ -1,0 +1,138 @@
+name: onec-kafka-pg
+
+services:
+
+  kafka:
+    image: apache/kafka:3.8.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-9094}:9094"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  # Однократно создаёт топики (идемпотентно, --if-not-exists)
+  kafka-init:
+    image: apache/kafka:3.8.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        T=/opt/kafka/bin/kafka-topics.sh
+        B=kafka:9092
+        # основные топики: compaction по ключу (id объекта 1С) — хранится последняя версия каждого объекта
+        $$T --bootstrap-server $$B --create --if-not-exists --topic 1c.ownership_forms.v1 --partitions 3 --replication-factor 1 --config cleanup.policy=compact
+        $$T --bootstrap-server $$B --create --if-not-exists --topic 1c.counterparties.v1 --partitions 3 --replication-factor 1 --config cleanup.policy=compact
+        # dead-letter topics: обычное удаление по времени (14 дней)
+        $$T --bootstrap-server $$B --create --if-not-exists --topic 1c.ownership_forms.dlq --partitions 1 --replication-factor 1 --config retention.ms=1209600000
+        $$T --bootstrap-server $$B --create --if-not-exists --topic 1c.counterparties.dlq --partitions 1 --replication-factor 1 --config retention.ms=1209600000
+        $$T --bootstrap-server $$B --list
+    restart: "no"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "${KAFKA_UI_PORT:-8090}:8080"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./sql:/sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  integration-service:
+    build: ./integration-service
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      ONEC_ODATA_URL: ${ONEC_ODATA_URL}
+      ONEC_USER: ${ONEC_USER:-}
+      ONEC_PASSWORD: ${ONEC_PASSWORD:-}
+      ONEC_PAGE_SIZE: ${ONEC_PAGE_SIZE:-500}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC_OWNERSHIP_FORMS: 1c.ownership_forms.v1
+      TOPIC_COUNTERPARTIES: 1c.counterparties.v1
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-0}
+      SYNC_OVERLAP_SECONDS: ${SYNC_OVERLAP_SECONDS:-5}
+      RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    extra_hosts:
+      # 1С опубликована на веб-сервере хост-машины (вне Docker)
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${INTEGRATION_HEALTH_PORT:-8081}:8081"
+    volumes:
+      - sync-state:/data
+
+  consumer-service:
+    build:
+      context: .
+      dockerfile: consumer-service/Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-pg-sink}
+      TOPIC_OWNERSHIP_FORMS: 1c.ownership_forms.v1
+      TOPIC_COUNTERPARTIES: 1c.counterparties.v1
+      POSTGRES_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${CONSUMER_HEALTH_PORT:-8082}:8082"
+    restart: unless-stopped
+
+  # Эмулятор OData 1С — только если реальная 1С не опубликована (COMPOSE_PROFILES=mock)
+  onec-mock:
+    profiles: ["mock"]
+    build: ./1c/odata-mock
+    ports:
+      - "${ONEC_MOCK_PORT:-8085}:8080"
+
+volumes:
+  kafka-data:
+  pg-data:
+  sync-state:

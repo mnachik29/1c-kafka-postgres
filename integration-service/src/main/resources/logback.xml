@@ -1,0 +1,15 @@
+<configuration>
+    <!-- Структурированные JSON-логи в stderr; stdout остаётся для итогового отчёта команды sync -->
+    <appender name="OUT" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <customFields>{"service":"integration-service"}</customFields>
+        </encoder>
+    </appender>
+
+    <logger name="org.apache.kafka" level="WARN"/>
+
+    <root level="${LOG_LEVEL:-INFO}">
+        <appender-ref ref="OUT"/>
+    </root>
+</configuration>

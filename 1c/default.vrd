@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Публикация демо-базы на веб-сервере. Путь к базе в атрибуте ib подставляет scripts\1c.ps1 publish -->
+<point xmlns="http://v8.1c.ru/8.2/virtual-resource-system"
+       xmlns:xs="http://www.w3.org/2001/XMLSchema"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       base="/demo1c"
+       ib="File=&quot;__IB_PATH__&quot;;">
+    <standardOdata enable="true"
+                   reuseSessions="autouse"
+                   sessionMaxAge="20"
+                   poolSize="10"
+                   poolTimeout="5"/>
+</point>
