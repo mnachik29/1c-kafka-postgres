@@ -1,0 +1,77 @@
+### Демо-сценарий через HTTP Client IntelliJ IDEA.
+### Запросы выполняются по порядку кнопкой ▶ слева от каждого.
+### Синхронизация запускается ручкой POST /sync integration-service (или конфигурациями из .run/),
+### результат в PostgreSQL — sql/checks.sql в Database tool window.
+
+@odata = http://localhost/demo1c/odata/standard.odata
+# для эмулятора: @odata = http://localhost:8085/demo1c/odata/standard.odata
+@sync = http://localhost:8081
+
+### 1. Состав OData: оба справочника и реквизит ДатаИзменения
+GET {{odata}}/$metadata
+
+### 2. Формы собственности в 1С
+GET {{odata}}/Catalog_ФормыСобственности?$format=json&$select=Ref_Key,Code,Description,DeletionMark,ДатаИзменения
+### 3. Контрагенты в 1С — ровно тот запрос, которым читает integration-service (полная выгрузка)
+GET {{odata}}/Catalog_Контрагенты?$format=json&$select=Ref_Key,Code,Description,ИНН,КПП,ФормаСобственности_Key,DeletionMark,ДатаИзменения,DataVersion&$orderby=ДатаИзменения,Ref_Key&$top=500&$skip=0
+
+### 4. Полная синхронизация 1С → Kafka (ответ — отчёт: прочитано / опубликовано / новая метка)
+# если задан SYNC_API_TOKEN, добавьте заголовок: Authorization: Bearer <токен>
+POST {{sync}}/sync?mode=full
+
+### 5. Повторная полная синхронизация — в PostgreSQL дублей не появится (конфигурация «4. db check»)
+POST {{sync}}/sync?mode=full
+
+### 6. Найти ООО «Ромашка» и ООО «Лютик» (сохраняет их Ref_Key для шагов 7–10)
+GET {{odata}}/Catalog_Контрагенты?$format=json&$select=Ref_Key,Description,КПП,DeletionMark
+
+> {%
+    // ES5: обработчики HTTP Client в IDEA 2023.x не поддерживают const / for…of
+    var body = typeof response.body === "string" ? JSON.parse(response.body) : response.body;
+    var items = body.value;
+    for (var i = 0; i < items.length; i++) {
+        if (items[i].Description.indexOf("Ромашка") >= 0) client.global.set("romashka", items[i].Ref_Key);
+        if (items[i].Description.indexOf("Лютик") >= 0) client.global.set("lyutik", items[i].Ref_Key);
+    }
+    client.test("Найдены Ромашка и Лютик", function () {
+        client.assert(client.global.get("romashka"), "ООО «Ромашка» не найдена");
+        client.assert(client.global.get("lyutik"), "ООО «Лютик» не найден");
+    });
+    client.log("Ромашка: " + client.global.get("romashka") + ", Лютик: " + client.global.get("lyutik"));
+%}
+
+### 7. Изменить контрагента в 1С: КПП «Ромашки» (запись идёт через объект 1С → ПередЗаписью ставит ДатаИзменения)
+PATCH {{odata}}/Catalog_Контрагенты(guid'{{romashka}}')?$format=json
+Content-Type: application/json
+
+{"КПП": "770101003"}
+
+### 8. Пометить «Лютик» на удаление
+PATCH {{odata}}/Catalog_Контрагенты(guid'{{lyutik}}')?$format=json
+Content-Type: application/json
+
+{"DeletionMark": true}
+
+### 9. Инкрементальная синхронизация — из контрагентов уйдут изменённые «Ромашка» и «Лютик»
+# Записи на границе окна (ДатаИзменения = метке, например все формы собственности из начального заполнения)
+# уходят повторно — это перекрытие SYNC_OVERLAP_SECONDS; upsert их не меняет (rows_changed: 0).
+POST {{sync}}/sync?mode=incremental
+
+### 10. Снять пометку удаления (вернуть исходное состояние после демо)
+PATCH {{odata}}/Catalog_Контрагенты(guid'{{lyutik}}')?$format=json
+Content-Type: application/json
+
+{"DeletionMark": false}
+
+### 11. Сбросить метки синхронизации (обоих справочников) и выгрузить контрагентов заново
+# Следующий incremental по формам собственности выгрузит их целиком — метки у них не будет.
+POST {{sync}}/sync?mode=full&entity=counterparties&reset=true
+
+### 12. Health integration-service (+ доступность 1С и итог последней синхронизации)
+GET {{sync}}/health
+
+### 13. Health consumer-service (PostgreSQL + consumer loop)
+GET http://localhost:8082/health
+
+### 14. Метрики consumer-service
+GET http://localhost:8082/metrics

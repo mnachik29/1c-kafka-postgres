@@ -5,6 +5,9 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import ru.integration.onec.http.HealthEndpoints;
+import ru.integration.onec.http.HttpApi;
+import ru.integration.onec.http.SyncEndpoint;
 import ru.integration.onec.kafka.EventPublisher;
 import ru.integration.onec.odata.ODataClient;
 import ru.integration.onec.sync.Catalog;
@@ -24,7 +27,8 @@ import static net.logstash.logback.argument.StructuredArguments.kv;
 /**
  * Точка входа.
  * <pre>
- *   serve                                   — healthcheck + (опционально) инкрементальная синхронизация по расписанию
+ *   serve                                   — HTTP API (GET /health, GET /metrics, POST /sync) +
+ *                                             (опционально) инкрементальная синхронизация по расписанию
  *   sync --mode full|incremental
  *        [--entity all|ownership_forms|counterparties]
  *        [--since 2026-07-10T12:00:00]      — явная метка для инкрементального режима (UTC)
@@ -68,18 +72,13 @@ public final class Main {
 
     private static int sync(Config config, ObjectMapper mapper, String[] args) throws Exception {
         SyncService.Mode mode = null;
-        List<Catalog> catalogs = List.of(Catalog.OWNERSHIP_FORMS, Catalog.COUNTERPARTIES);
+        List<Catalog> catalogs = SyncService.catalogs(null);
         LocalDateTime since = null;
         boolean reset = false;
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--mode" -> mode = SyncService.Mode.valueOf(value(args, ++i, "--mode").toUpperCase());
-                case "--entity" -> {
-                    String entity = value(args, ++i, "--entity");
-                    if (!entity.equals("all")) {
-                        catalogs = List.of(Catalog.byKey(entity));
-                    }
-                }
+                case "--entity" -> catalogs = SyncService.catalogs(value(args, ++i, "--entity"));
                 case "--since" -> since = LocalDateTime.parse(value(args, ++i, "--since"));
                 case "--reset-state" -> reset = true;
                 default -> throw new IllegalArgumentException("Unknown option: " + args[i]);
@@ -91,47 +90,48 @@ public final class Main {
 
         ODataClient odata = new ODataClient(config, mapper);
         StateStore state = new StateStore(config.stateDir(), mapper);
-        if (reset) {
-            state.reset();
-            log.info("Sync state reset");
-        }
         try (EventPublisher publisher = new EventPublisher(config, mapper)) {
-            List<SyncService.Result> results = new SyncService(config, odata, publisher, state).run(mode, catalogs, since);
+            List<SyncService.Result> results = new SyncService(config, odata, publisher, state)
+                    .run(mode, catalogs, since, reset);
             System.out.println(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(results));
             return 0;
         } catch (Exception e) {
-            log.error("Synchronization failed", kv("mode", mode), kv("error", e.toString()), e);
-            return 1;
+            return 1; // уже залогировано в SyncService
         }
     }
 
     private static void serve(Config config, ObjectMapper mapper) throws Exception {
         ODataClient odata = new ODataClient(config, mapper);
-        HealthServer health = new HealthServer(mapper, odata);
-        health.start(config.healthPort());
+        EventPublisher publisher = new EventPublisher(config, mapper);
+        SyncService service = new SyncService(config, odata, publisher, new StateStore(config.stateDir(), mapper));
+        HealthEndpoints health = new HealthEndpoints(mapper, odata, service.stats());
+        new HttpApi(config.healthPort())
+                .route("/health", health::health)
+                .route("/metrics", health::metrics)
+                .route("/sync", new SyncEndpoint(mapper, service, config.syncApiToken()))
+                .start();
         log.info("Integration service started", kv("health_port", config.healthPort()),
-                kv("odata_url", config.odataUrl()), kv("schedule_interval_s", config.scheduleInterval().toSeconds()));
+                kv("odata_url", config.odataUrl()), kv("schedule_interval_s", config.scheduleInterval().toSeconds()),
+                kv("sync_api_auth", config.syncApiToken().isEmpty() ? "disabled" : "token"));
 
         CountDownLatch stop = new CountDownLatch(1);
-        Runtime.getRuntime().addShutdownHook(new Thread(stop::countDown));
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            publisher.close();
+            stop.countDown();
+        }));
 
         if (!config.scheduleInterval().isZero()) {
-            EventPublisher publisher = new EventPublisher(config, mapper);
-            SyncService service = new SyncService(config, odata, publisher, new StateStore(config.stateDir(), mapper));
             ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
             scheduler.scheduleWithFixedDelay(() -> {
                 try {
-                    health.recordSuccess(service.run(SyncService.Mode.INCREMENTAL,
-                            List.of(Catalog.OWNERSHIP_FORMS, Catalog.COUNTERPARTIES), null));
+                    service.run(SyncService.Mode.INCREMENTAL, SyncService.catalogs(null), null);
+                } catch (SyncService.AlreadyRunningException e) {
+                    log.info("Scheduled sync skipped: another synchronization is running");
                 } catch (Exception e) {
-                    health.recordFailure(e);
-                    log.error("Scheduled sync failed", kv("error", e.toString()));
+                    // уже залогировано в SyncService; следующая попытка — по расписанию
                 }
             }, 10, config.scheduleInterval().toSeconds(), TimeUnit.SECONDS);
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                scheduler.shutdownNow();
-                publisher.close();
-            }));
+            Runtime.getRuntime().addShutdownHook(new Thread(scheduler::shutdownNow));
         }
         stop.await();
     }

@@ -20,7 +20,8 @@ public record Config(
         Path stateDir,
         Duration incrementalOverlap,
         int healthPort,
-        Duration scheduleInterval
+        Duration scheduleInterval,
+        String syncApiToken
 ) {
 
     public static Config fromEnv() {
@@ -38,7 +39,8 @@ public record Config(
                 Path.of(env("STATE_DIR", "/data")),
                 Duration.ofSeconds(intEnv("SYNC_OVERLAP_SECONDS", 5)),
                 intEnv("HEALTH_PORT", 8081),
-                Duration.ofSeconds(intEnv("SYNC_INTERVAL_SECONDS", 0))
+                Duration.ofSeconds(intEnv("SYNC_INTERVAL_SECONDS", 0)),
+                env("SYNC_API_TOKEN", "")
         );
     }
 

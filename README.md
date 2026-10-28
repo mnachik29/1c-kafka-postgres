@@ -66,7 +66,7 @@ docker compose ps           # integration-service и consumer-service должн
 | Что | Адрес |
 |---|---|
 | Kafka UI | http://localhost:8090 |
-| integration-service health/metrics | http://localhost:8081/health, `/metrics` |
+| integration-service health/metrics, запуск синхронизации | http://localhost:8081/health, `/metrics`, `POST /sync` |
 | consumer-service health/metrics | http://localhost:8082/health, `/metrics` |
 | PostgreSQL | `localhost:5432`, логин и пароль из `.env` |
 | Kafka с хоста | `localhost:9094` |
@@ -93,6 +93,12 @@ docker compose exec integration-service ./sync --mode incremental   # или: ma
 пометки удаления. Метка хранится по каждому справочнику в томе `sync-state` (`/data/sync-state.json`)
 и сдвигается только после того, как Kafka подтвердила доставку.
 
+Перекрытие окна нужно, чтобы не потерять запись, закоммиченную в 1С в ту же секунду, но позже чтения.
+Чтобы оно не отправляло одно и то же каждый раз, вместе с меткой сохраняются версии записей на границе
+окна (`Ref_Key → DataVersion`): обычный инкремент такие записи читает, но повторно не публикует — в отчёте
+они видны как `unchanged`. Изменённая запись получает в 1С новую `DataVersion` и уходит как обычно.
+`--mode full` и явный `--since` публикуют всё.
+
 Дополнительно:
 
 ```bash
@@ -103,6 +109,22 @@ docker compose exec integration-service ./sync --mode incremental   # или: ma
 
 Чтобы синхронизация шла автоматически, задайте `SYNC_INTERVAL_SECONDS=60`: сервис будет запускать
 инкрементальную выгрузку с этим интервалом.
+
+**Запуск по HTTP.** Те же режимы доступны без `docker compose exec` — ручкой integration-service
+(удобно из HTTP Client IDEA, `demo/demo.http`, или для вызова из самой 1С после записи объекта):
+
+```bash
+curl -X POST 'http://localhost:8081/sync?mode=full'                         # или: make api-sync-full
+curl -X POST 'http://localhost:8081/sync?mode=incremental'                  # или: make api-sync-incremental
+curl -X POST 'http://localhost:8081/sync?mode=full&entity=counterparties&reset=true'
+curl -X POST 'http://localhost:8081/sync?mode=incremental&since=2026-07-10T12:00:00'
+```
+
+Запрос синхронный: ответ `200` приходит после подтверждения Kafka и содержит тот же отчёт, что и CLI.
+`400` — неверные параметры, `409` — синхронизация уже идёт (расписание, CLI и HTTP делят одну
+блокировку), `500` — ошибка синхронизации (метка не сдвигается, запрос можно повторить).
+Если задан `SYNC_API_TOKEN`, нужен заголовок `Authorization: Bearer <токен>`; пустое значение
+отключает проверку и годится только для локального стенда.
 
 **Перезапуск синхронизации.** Все команды безопасно повторять: запись в PostgreSQL идемпотентна.
 После сбоя достаточно запустить ту же команду ещё раз. Если метки потеряны или сомнительны —
@@ -181,6 +203,11 @@ docker compose exec postgres psql -U integration -d integration -f /sql/checks.s
 | Запись обновилась | `make db-check` (КПП «Ромашки», `imported_at`) | то же |
 | Пометить на удаление | `.\scripts\1c.ps1 demo-delete`, F8/Del в 1С или `… scripts/odata-demo.sh delete` | `sh scripts/odata-demo.sh delete` |
 | `deleted = true` | `make sync-incremental` → `make db-check` | то же |
+
+**Повторить демо с начала:** `make demo-reset` (или `bash scripts/demo-reset.sh`). Скрипт возвращает
+тестовым контрагентам в 1С исходные ИНН и КПП, снимает пометки удаления и пересоздаёт Kafka, PostgreSQL
+и метки синхронизации с нуля. В IntelliJ IDEA то же делает конфигурация запуска `0. reset demo` из `.run/`;
+запросы демо-сценария для HTTP Client лежат в [demo/demo.http](demo/demo.http).
 
 `scripts/odata-demo.sh` меняет данные через PATCH стандартного OData 1С. Запись идёт через объект 1С,
 поэтому `ПередЗаписью` проставляет `ДатаИзменения` так же, как при правке в интерфейсе. Пакетные команды

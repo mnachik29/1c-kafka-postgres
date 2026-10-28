@@ -1,7 +1,7 @@
 DC = docker compose
 PSQL = $(DC) exec -T postgres sh -c 'psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" "$$@"' --
 
-.PHONY: up down reset logs sync-full sync-incremental sync-reset topics events-ownership events-counterparties dlq db-check psql
+.PHONY: up down reset demo-reset logs sync-full sync-incremental sync-reset api-sync-full api-sync-incremental topics events-ownership events-counterparties dlq db-check psql
 
 up:                     ## поднять инфраструктуру и сервисы
 	$(DC) up -d --build
@@ -11,6 +11,9 @@ down:
 
 reset:                  ## удалить все данные (Kafka, PostgreSQL, метки синхронизации)
 	$(DC) down -v
+
+demo-reset:             ## исходное состояние демо: тестовые данные 1С + пустые Kafka/PostgreSQL
+	bash scripts/demo-reset.sh
 
 logs:
 	$(DC) logs -f integration-service consumer-service
@@ -23,6 +26,12 @@ sync-incremental:       ## только изменённые с прошлого
 
 sync-reset:             ## сбросить метки и выгрузить всё заново
 	$(DC) exec integration-service ./sync --mode full --reset-state
+
+api-sync-full:          ## то же через HTTP-ручку integration-service
+	curl -fsS -X POST 'http://localhost:8081/sync?mode=full'; echo
+
+api-sync-incremental:
+	curl -fsS -X POST 'http://localhost:8081/sync?mode=incremental'; echo
 
 topics:
 	$(DC) exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe
